@@ -100,6 +100,43 @@ int lastClockBtnState = -1;    /* -1 = not yet read, so first edge is ignored fo
 unsigned long lastClockBtnMillis = 0;
 #define CLOCK_BTN_DEBOUNCE_MS 250
 
+/* ================= TOUCH PET (HW-763 / TTP223 on GPIO 21) ================= */
+#define TOUCH_PIN 21
+#define TOUCH_TOUCHED HIGH
+#define TOUCH_DEBOUNCE_MS 50
+#define PET_HOLD_MS 400
+#define PET_PURR_CADENCE_MS 1200
+#define TAP_COMBO_COUNT 3
+#define TAP_COMBO_WINDOW_MS 1200
+#define AFFECTION_MAX 100
+#define AFFECTION_TAP 12
+#define AFFECTION_HOLD 6
+#define AFFECTION_DECAY_MS 4000
+#define AFFECTION_HAPPY_THRESHOLD 25
+#define AFFECTION_ECSTATIC 80
+#define ECSTATIC_COOLDOWN_MS 8000
+#define OVERSTIM_COUNT 7
+#define OVERSTIM_WINDOW_MS 3500
+#define GRUMPY_COOLDOWN_MS 6000
+
+int lastTouchState = -1;
+unsigned long lastTouchEdgeMillis = 0;
+unsigned long touchPressStart = 0;
+bool touchHolding = false;
+bool holdTriggered = false;
+unsigned long lastStrokePurrMs = 0;
+
+int tapComboCount = 0;
+unsigned long lastTapMillis = 0;
+
+int affection = 0;
+unsigned long lastAffectionDecay = 0;
+unsigned long lastEcstaticDanceMs = 0;
+
+int petCountWindow = 0;
+unsigned long overstimWindowStart = 0;
+unsigned long grumpyUntilMs = 0;
+
 /* ================= WIFI ================= */
 WebServer server(80);
 DNSServer dnsServer;
@@ -389,6 +426,117 @@ void updateDance() {
     }
     danceStepStart = millis();
     setMotors((MotorDir)seq.cmds[danceStepIndex]);
+  }
+}
+
+/* ================= PET INTERACTION ================= */
+static void registerPet(bool isHold) {
+  unsigned long now = millis();
+
+  if (now < grumpyUntilMs) return;
+
+  if (overstimWindowStart == 0 || (now - overstimWindowStart) > (unsigned long)OVERSTIM_WINDOW_MS) {
+    overstimWindowStart = now;
+    petCountWindow = 0;
+  }
+  petCountWindow++;
+  if (petCountWindow >= OVERSTIM_COUNT) {
+    grumpyUntilMs = now + GRUMPY_COOLDOWN_MS;
+    roboEyes.setMood(ANGRY);
+    soundMoodAngry();
+    pulseMotor(DIR_BACK, 30, 50, 2);
+    petCountWindow = 0;
+    tapComboCount = 0;
+    return;
+  }
+
+  affection = min(AFFECTION_MAX, affection + (isHold ? AFFECTION_HOLD : AFFECTION_TAP));
+
+  if (!isHold) {
+    if (lastTapMillis == 0 || (now - lastTapMillis) > (unsigned long)TAP_COMBO_WINDOW_MS) {
+      tapComboCount = 0;
+    }
+    tapComboCount++;
+    lastTapMillis = now;
+
+    if (tapComboCount >= TAP_COMBO_COUNT) {
+      tapComboCount = 0;
+      startDance(0);
+      return;
+    }
+
+    soundPurr();
+    roboEyes.setMood(HAPPY);
+    pulseMotor(DIR_FWD, 20, 40, 1);
+  } else {
+    soundPurr();
+    roboEyes.setMood(HAPPY);
+  }
+
+  if (affection >= AFFECTION_ECSTATIC && (now - lastEcstaticDanceMs) >= (unsigned long)ECSTATIC_COOLDOWN_MS) {
+    roboEyes.anim_laugh();
+    startDance(2);
+    lastEcstaticDanceMs = now;
+  }
+}
+
+void updatePet() {
+  int touch = digitalRead(TOUCH_PIN);
+  unsigned long now = millis();
+
+  if (lastTouchState == -1) lastTouchState = touch;
+
+  bool rising = (touch == TOUCH_TOUCHED && lastTouchState != TOUCH_TOUCHED);
+  bool falling = (touch != TOUCH_TOUCHED && lastTouchState == TOUCH_TOUCHED);
+
+  if (rising && (now - lastTouchEdgeMillis) >= (unsigned long)TOUCH_DEBOUNCE_MS) {
+    lastTouchEdgeMillis = now;
+    touchPressStart = now;
+    touchHolding = true;
+    holdTriggered = false;
+  }
+
+  if (touchHolding && touch == TOUCH_TOUCHED && !holdTriggered && (now - touchPressStart) >= (unsigned long)PET_HOLD_MS) {
+    holdTriggered = true;
+    if (!clockState.active && !danceActive) {
+      registerPet(true);
+      lastStrokePurrMs = now;
+    }
+  }
+
+  if (touchHolding && holdTriggered && touch == TOUCH_TOUCHED && !clockState.active && !danceActive) {
+    if ((now - lastStrokePurrMs) >= (unsigned long)PET_PURR_CADENCE_MS) {
+      registerPet(true);
+      lastStrokePurrMs = now;
+    }
+  }
+
+  if (falling && touchHolding) {
+    if (!holdTriggered && (now - touchPressStart) < (unsigned long)PET_HOLD_MS) {
+      if (!clockState.active && !danceActive) registerPet(false);
+    }
+    touchHolding = false;
+    holdTriggered = false;
+  }
+
+  if (touch != lastTouchState) lastTouchEdgeMillis = now;
+  lastTouchState = touch;
+
+  if (tapComboCount > 0 && lastTapMillis > 0 && (now - lastTapMillis) > (unsigned long)TAP_COMBO_WINDOW_MS) {
+    tapComboCount = 0;
+  }
+
+  if (grumpyUntilMs > 0 && now >= grumpyUntilMs) {
+    grumpyUntilMs = 0;
+    roboEyes.setMood(DEFAULT);
+  }
+
+  if (affection > 0 && (now - lastAffectionDecay) >= (unsigned long)AFFECTION_DECAY_MS) {
+    affection--;
+    lastAffectionDecay = now;
+    if (affection < AFFECTION_HAPPY_THRESHOLD && grumpyUntilMs == 0 && !danceActive) {
+      roboEyes.setMood(DEFAULT);
+    }
   }
 }
 
@@ -791,7 +939,7 @@ void setup() {
   pinMode(LF,OUTPUT); pinMode(LB,OUTPUT);
   pinMode(RF,OUTPUT); pinMode(RB,OUTPUT);
 
-  Serial.begin(115200);
+  /* GPIO21 is UART0 TX on ESP32-C3; keep Serial off so touch sensor can use it. */
   Wire.begin(OLED_SDA, OLED_SCL);
   display.begin(SSD1306_SWITCHCAPVCC,0x3C);
   display.clearDisplay(); display.display();
@@ -810,7 +958,8 @@ void setup() {
   pinMode(CLOCK_BTN_PIN, INPUT_PULLUP);
   lastClockBtnState = -1;
 
-  Serial.write("LETS GO!");
+  pinMode(TOUCH_PIN, INPUT);
+  lastTouchState = -1;
 
   WiFi.softAP("MOCHAN");
   dnsServer.start(53,"*",WiFi.softAPIP());
@@ -841,6 +990,8 @@ void loop() {
   }
   if (btn != lastClockBtnState) lastClockBtnMillis = now;
   lastClockBtnState = btn;
+
+  updatePet();
 
   if (clockState.active) {
     updateClockSeconds();
